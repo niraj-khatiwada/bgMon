@@ -6,7 +6,8 @@ version="$(tr -d '\n' < VERSION)"
 swift build -c release --scratch-path "$project_root/.build-release"
 binary_dir="$(swift build -c release --scratch-path "$project_root/.build-release" --show-bin-path)"
 app="$project_root/outputs/bgMon.app"
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp "$project_root/Assets/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 cp "$binary_dir/bgMon" "$app/Contents/MacOS/bgMon"
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -14,6 +15,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <plist version="1.0"><dict>
 <key>CFBundleExecutable</key><string>bgMon</string>
 <key>CFBundleIdentifier</key><string>app.bgmon.bgMon</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundleName</key><string>bgMon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$version</string>

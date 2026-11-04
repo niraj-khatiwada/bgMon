@@ -207,8 +207,15 @@ struct ProcessGroup: Identifiable {
         }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: currentPath)])
     }
-    func stopAll(_ group: ProcessGroup) {
-        for entry in group.entries { stop(entry, force: false, refreshAfter: false) }
+    private var groupQuitRequests: [String: Date] = [:]
+    func recentlyRequestedQuit(_ group: ProcessGroup) -> Bool {
+        guard let date = groupQuitRequests[group.id] else { return false }
+        return Date().timeIntervalSince(date) < 10
+    }
+    func stopAll(_ group: ProcessGroup, force: Bool = false) {
+        groupQuitRequests = groupQuitRequests.filter { Date().timeIntervalSince($0.value) < 10 }
+        groupQuitRequests[group.id] = Date()
+        for entry in group.entries { stop(entry, force: force, refreshAfter: false) }
         Task { await refresh() }
     }
     func stop(_ entry: Entry, force: Bool, refreshAfter: Bool = true) {
@@ -297,7 +304,9 @@ struct ProcessGroup: Identifiable {
         if popover.isShown {
             if !pinned { popover.performClose(nil) }
         } else if let button = statusItem?.button {
+            NSApplication.shared.activate(ignoringOtherApps: true)
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
         }
     }
 
@@ -347,6 +356,7 @@ struct MonitorView: View {
     @ObservedObject private var monitor = PanelController.shared.monitor
     @ObservedObject private var panel = PanelController.shared
     @State private var pending: Entry?
+    @State private var pendingGroup: ProcessGroup?
     @State private var expanded = Set<String>()
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -450,7 +460,10 @@ struct MonitorView: View {
                                 Text("\(group.entries.count)").font(.caption).foregroundStyle(.secondary)
                                     }.contentShape(Rectangle())
                                 }.buttonStyle(.plain)
-                                Button { monitor.stopAll(group) } label: {
+                                Button {
+                                    if monitor.recentlyRequestedQuit(group) { pendingGroup = group }
+                                    else { monitor.stopAll(group) }
+                                } label: {
                                     Image(systemName: "power").frame(width: 20, height: 20)
                                 }
                                 .buttonStyle(.plain)
@@ -465,21 +478,44 @@ struct MonitorView: View {
                 }
 
             }.scrollIndicators(.hidden).frame(height: 420)
+        }.padding(12).frame(width: 360)
+        .overlay(alignment: .bottom) {
             if let message = monitor.message {
                 Text(message)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .padding(8)
                     .transition(.opacity)
+                    .allowsHitTesting(false)
             }
-        }.padding(12).frame(width: 360)
+        }
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .animation(.easeInOut(duration: 0.25), value: monitor.message)
         .tint(.blue)
         .buttonStyle(.borderedProminent)
 
+        .confirmationDialog("Quit \(pendingGroup?.name ?? "App")?", isPresented: Binding(
+            get: { pendingGroup != nil },
+            set: { if !$0 { pendingGroup = nil } }
+        ), titleVisibility: .visible) {
+            Button("Quit Normally") {
+                if let group = pendingGroup { monitor.stopAll(group) }
+                pendingGroup = nil
+            }
+            Button("Force Quit All", role: .destructive) {
+                if let group = pendingGroup { monitor.stopAll(group, force: true) }
+                pendingGroup = nil
+            }
+            Button("Cancel", role: .cancel) { pendingGroup = nil }
+        } message: {
+            Text("A quit was already requested. Force quitting stops all listed processes in this group and may lose unsaved work.")
+        }
         .alert("Force stop this process?", isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } })) {
             Button("Cancel", role: .cancel) { pending = nil }
             Button("Force Stop", role: .destructive) { if let pending { monitor.stop(pending, force: true) }; pending = nil }
