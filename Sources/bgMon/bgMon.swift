@@ -1,0 +1,527 @@
+import SwiftUI
+import AppKit
+import Darwin
+
+enum ProcessMemory {
+    static func display(pid: Int32) -> String {
+        var usage = rusage_info_v2()
+        let result = withUnsafeMutablePointer(to: &usage) { pointer in
+            pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+                proc_pid_rusage(pid, RUSAGE_INFO_V2, $0)
+            }
+        }
+        guard result == 0 else { return "—" }
+        return String(format: "%.1f MB", Double(usage.ri_phys_footprint) / 1_000_000)
+    }
+}
+
+struct Entry: Identifiable, Sendable {
+    let id: Int32
+    let parent: Int32
+    let cpu: String
+    let memory: String
+    let command: String
+    var ports: [Int] = []
+    var name: String { URL(fileURLWithPath: command).lastPathComponent }
+}
+
+struct ProcessGroup: Identifiable {
+    let id: String
+    let name: String
+    let icon: NSImage?
+    let entries: [Entry]
+    var ports: [Int] { Set(entries.flatMap(\.ports)).sorted() }
+    var cpuTotal: Double { entries.reduce(0) { $0 + (Double($1.cpu) ?? 0) } }
+    var memoryTotal: Double { entries.reduce(0) { $0 + (Double($1.memory.replacingOccurrences(of: " MB", with: "")) ?? 0) } }
+    var totals: String {
+        let cpu = entries.reduce(0.0) { $0 + (Double($1.cpu) ?? 0) }
+        let values = entries.compactMap { Double($0.memory.replacingOccurrences(of: " MB", with: "")) }
+        let memory = values.reduce(0, +)
+        let suffix = values.count == entries.count ? "" : " + unknown"
+        return String(format: "CPU %.1f%% · %.1f MB", cpu, memory) + suffix
+    }
+}
+
+@MainActor final class Monitor: ObservableObject {
+    @Published var entries: [Entry] = []
+    @Published var warnings: [String: String] = [:]
+    private var cachedGroups: [ProcessGroup] = []
+    private var ownerCache: [Int32: URL] = [:]
+    private var iconCache: [String: NSImage] = [:]
+    private var eligibleGroupIDs = Set<String>()
+    private var highCPUSamples: [String: Int] = [:]
+    private let cpuSampler = CPUSampler()
+    private var previousCPUThreshold: Double?
+    var cpuThreshold: Double { UserDefaults.standard.object(forKey: "warningCPUPercent") as? Double ?? 75 }
+    var memoryThreshold: Double { UserDefaults.standard.object(forKey: "warningMemoryGB") as? Double ?? 2 }
+    @Published var search = ""
+    @Published var includeSystem = false { didSet { updateStatusWarning() } }
+    @Published var highUsageOnly = false
+    @Published var message: String? {
+        didSet {
+            messageDismissTask?.cancel()
+            guard message != nil else { return }
+            messageDismissTask = Task { [weak self] in
+                do { try await Task.sleep(for: .seconds(3)) } catch { return }
+                guard !Task.isCancelled else { return }
+                withAnimation(.easeInOut(duration: 0.25)) { self?.message = nil }
+            }
+        }
+    }
+    private var messageDismissTask: Task<Void, Never>?
+    @Published var refreshing = false
+    @Published var apps: [pid_t: NSRunningApplication] = [:]
+    func isSystemURL(_ url: URL) -> Bool {
+        let path = url.path
+        return path.hasPrefix("/System/") || path.hasPrefix("/Library/Apple/") || path.hasPrefix("/usr/")
+    }
+    func included(_ entry: Entry) -> Bool {
+        let owner = ownerURL(entry)
+        let appleApp = owner.flatMap { Bundle(url: $0)?.bundleIdentifier }?.hasPrefix("com.apple.") == true
+        return includeSystem || !(appleApp || isSystemURL(owner ?? URL(fileURLWithPath: entry.command)))
+    }
+    var filtered: [Entry] {
+        entries.filter { entry in
+            let ownerName = ownerURL(entry)?.deletingPathExtension().lastPathComponent ?? ""
+            return included(entry) && (search.isEmpty || entry.command.localizedCaseInsensitiveContains(search) || ownerName.localizedCaseInsensitiveContains(search))
+        }
+    }
+    func updateStatusWarning() {
+        eligibleGroupIDs = Set(entries.filter { included($0) }.map { ownerURL($0)?.path ?? $0.command })
+        let activeGroups = cachedGroups.filter { eligibleGroupIDs.contains($0.id) && warnings[$0.id] != nil }
+        PanelController.shared.updateWarning(!activeGroups.isEmpty)
+    }
+    func ownerURL(_ entry: Entry) -> URL? { ownerCache[entry.id] }
+    func resolveOwner(_ entry: Entry, byPID: [Int32: Entry]) -> URL? {
+        var current = entry
+        var visited = Set<Int32>()
+        var fallback: URL?
+        while visited.insert(current.id).inserted {
+            let candidate: URL?
+            if let range = current.command.range(of: ".app/") {
+                candidate = URL(fileURLWithPath: String(current.command[..<range.lowerBound]) + ".app")
+            } else { candidate = apps[current.id]?.bundleURL }
+            if let candidate {
+                // A system helper can belong to a third-party ancestor.
+                if !isSystemURL(candidate) { return candidate }
+                if fallback == nil { fallback = candidate }
+            }
+            guard let parent = byPID[current.parent] else { break }
+            current = parent
+        }
+        return fallback
+    }
+    var groups: [ProcessGroup] {
+        cachedGroups.filter { group in
+            eligibleGroupIDs.contains(group.id) && (!highUsageOnly || warnings[group.id] != nil) &&
+            (search.isEmpty || group.name.localizedCaseInsensitiveContains(search) ||
+             group.entries.contains { $0.command.localizedCaseInsensitiveContains(search) })
+        }
+    }
+    func icon(for entry: Entry) -> NSImage? {
+        ownerURL(entry).flatMap { iconCache[$0.path] }
+    }
+    func makeGroups(_ processes: [Entry]) -> [ProcessGroup] {
+        let buckets = Dictionary(grouping: processes) { entry in
+            ownerURL(entry)?.path ?? entry.command
+        }
+        return buckets.map { key, members in
+            let url = ownerURL(members[0])
+            let bundle = url.flatMap { Bundle(url: $0) }
+            let name = (bundle?.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+                ?? (bundle?.object(forInfoDictionaryKey: "CFBundleName") as? String)
+                ?? url?.deletingPathExtension().lastPathComponent ?? members[0].name
+            if let url, iconCache[url.path] == nil { iconCache[url.path] = NSWorkspace.shared.icon(forFile: url.path) }
+            return ProcessGroup(id: key, name: name,
+                icon: url.flatMap { iconCache[$0.path] }, entries: members.sorted { lhs, rhs in
+                    let leftCPU = Double(lhs.cpu) ?? -1
+                    let rightCPU = Double(rhs.cpu) ?? -1
+                    if leftCPU != rightCPU { return leftCPU > rightCPU }
+                    let leftMemory = Double(lhs.memory.replacingOccurrences(of: " MB", with: "")) ?? -1
+                    let rightMemory = Double(rhs.memory.replacingOccurrences(of: " MB", with: "")) ?? -1
+                    if leftMemory != rightMemory { return leftMemory > rightMemory }
+                    return lhs.id < rhs.id
+                })
+        }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+    func refresh() async {
+        guard !refreshing else { return }
+        refreshing = true
+        let sampler = cpuSampler
+        let result = await Task.detached(priority: .utility) {
+            let ports = ListeningPorts.scan()
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/bin/ps")
+            task.arguments = ["-U", String(getuid()), "-o", "pid=,ppid=,%cpu=,rss=,comm="]
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = FileHandle.nullDevice
+            do { try task.run() } catch { return [Entry]() }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            task.waitUntilExit()
+            return String(decoding: data, as: UTF8.self).split(separator: "\n").compactMap { line -> Entry? in
+                let fields = line.split(maxSplits: 4, omittingEmptySubsequences: true, whereSeparator: { $0.isWhitespace })
+                guard fields.count == 5, let pid = Int32(fields[0]), let parent = Int32(fields[1]), pid != getpid(), pid != task.processIdentifier else { return nil }
+                var entry = Entry(id: pid, parent: parent, cpu: sampler.display(pid: pid), memory: ProcessMemory.display(pid: pid), command: String(fields[4]))
+                entry.ports = ports[pid] ?? []
+                return entry
+            }
+        }.value
+        cpuSampler.prune(livePIDs: Set(result.map(\.id)))
+        apps = Dictionary(uniqueKeysWithValues: NSWorkspace.shared.runningApplications.map { ($0.processIdentifier, $0) })
+        entries = result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        let byPID = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
+        ownerCache = [:]
+        for entry in entries { ownerCache[entry.id] = resolveOwner(entry, byPID: byPID) }
+        cachedGroups = makeGroups(entries)
+        reevaluateWarnings(countSample: true)
+        refreshing = false
+    }
+    func reevaluateWarnings(countSample: Bool = false) {
+        if previousCPUThreshold != cpuThreshold { highCPUSamples.removeAll(); previousCPUThreshold = cpuThreshold }
+        var updated: [String: String] = [:]
+        let allGroups = cachedGroups
+        let liveIDs = Set(allGroups.map(\.id))
+        highCPUSamples = highCPUSamples.filter { liveIDs.contains($0.key) }
+        for group in allGroups {
+            if countSample { highCPUSamples[group.id] = group.cpuTotal > cpuThreshold ? (highCPUSamples[group.id] ?? 0) + 1 : 0 }
+            var reasons: [String] = []
+            if (highCPUSamples[group.id] ?? 0) >= 3 { reasons.append("CPU above \(cpuThreshold.formatted())% for three refreshes") }
+            if group.memoryTotal > memoryThreshold * 1000 { reasons.append("Memory above \(memoryThreshold.formatted()) GB") }
+            if !reasons.isEmpty { updated[group.id] = reasons.joined(separator: " · ") }
+        }
+        warnings = updated
+        updateStatusWarning()
+    }
+    func showInFinder(_ entry: Entry) {
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        let count = proc_pidpath(entry.id, &buffer, UInt32(buffer.count))
+        let currentPath = String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        guard count > 0, currentPath == entry.command else {
+            message = "This process changed or exited. Refresh and try again."
+            return
+        }
+        guard FileManager.default.fileExists(atPath: currentPath) else {
+            message = "The executable file is no longer available."
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: currentPath)])
+    }
+    func stopAll(_ group: ProcessGroup) {
+        for entry in group.entries { stop(entry, force: false, refreshAfter: false) }
+        Task { await refresh() }
+    }
+    func stop(_ entry: Entry, force: Bool, refreshAfter: Bool = true) {
+        // Refuse to signal a reused PID pointing at a different executable.
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        let count = proc_pidpath(entry.id, &buffer, UInt32(buffer.count))
+        let path = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        guard count > 0, String(decoding: path, as: UTF8.self) == entry.command else {
+            message = "This process changed or exited. Refresh and try again."
+            return
+        }
+        if !force, let app = apps[entry.id] {
+            message = app.terminate() ? "Quit requested. The app may ask you to save work." : "The app declined the quit request."
+        } else {
+            message = kill(entry.id, force ? SIGKILL : SIGTERM) == 0 ? "Stop requested. A supervising service may restart it." : "Unable to stop this process: \(String(cString: strerror(errno)))"
+        }
+        if refreshAfter { Task { await refresh() } }
+    }
+}
+
+@MainActor final class PanelController: NSObject, ObservableObject, NSPopoverDelegate {
+    static let shared = PanelController()
+    @Published var pinned = false
+    private var statusItem: NSStatusItem?
+    private let popover = NSPopover()
+    private var settingsWindow: NSWindow?
+    func showSettings() {
+        if settingsWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 390, height: 200), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.title = "bgMon Settings"
+            window.isReleasedWhenClosed = false
+            window.contentViewController = NSHostingController(rootView: WarningSettingsView())
+            window.center()
+            settingsWindow = window
+        }
+        if !pinned { popover.performClose(nil) }
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+    let monitor = Monitor()
+    private var monitoringTask: Task<Void, Never>?
+    func updateWarning(_ active: Bool) {
+        guard let button = statusItem?.button else { return }
+        let image = NSImage(systemSymbolName: "waveform.path.ecg", accessibilityDescription: "bgMon")
+        if active, let image {
+            let colored = NSImage(size: image.size, flipped: false) { rect in
+                image.draw(in: rect)
+                NSColor.systemRed.setFill()
+                rect.fill(using: .sourceAtop)
+                return true
+            }
+            colored.isTemplate = false
+            button.image = colored
+        } else { image?.isTemplate = true; button.image = image }
+        button.toolTip = active ? "bgMon: High CPU or Memory Usage" : "bgMon"
+    }
+
+    func start() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.button?.image = NSImage(systemSymbolName: "waveform.path.ecg", accessibilityDescription: "bgMon")
+        item.button?.target = self
+        item.button?.action = #selector(togglePanel)
+        item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        statusItem = item
+        popover.behavior = .transient
+        popover.delegate = self
+        popover.contentViewController = NSHostingController(rootView: MonitorView())
+        monitoringTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await monitor.refresh()
+                do { try await Task.sleep(for: .seconds(3)) } catch { return }
+            }
+        }
+    }
+
+    @objc private func togglePanel() {
+        if NSApp.currentEvent?.type == .rightMouseUp, let button = statusItem?.button {
+            let menu = NSMenu()
+            let quit = NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "")
+            quit.target = self
+            menu.addItem(quit)
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY), in: button)
+            return
+        }
+        if popover.isShown {
+            if !pinned { popover.performClose(nil) }
+        } else if let button = statusItem?.button {
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+    }
+
+    @objc private func quitApp() { NSApplication.shared.terminate(nil) }
+
+    func togglePin() {
+        pinned.toggle()
+        popover.behavior = pinned ? .applicationDefined : .transient
+        popover.contentViewController?.view.window?.level = pinned ? .floating : .popUpMenu
+    }
+}
+
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApplication.shared.setActivationPolicy(.accessory)
+        PanelController.shared.start()
+    }
+}
+
+struct NativeSearchField: NSViewRepresentable {
+    @Binding var text: String
+    func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
+    func makeNSView(context: Context) -> NSSearchField {
+        let field = NSSearchField()
+        field.placeholderString = "Search Processes"
+        field.controlSize = .regular
+        field.sendsSearchStringImmediately = true
+        field.delegate = context.coordinator
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        return field
+    }
+    func updateNSView(_ field: NSSearchField, context: Context) {
+        context.coordinator.text = $text
+        if field.stringValue != text { field.stringValue = text }
+    }
+    final class Coordinator: NSObject, NSSearchFieldDelegate {
+        var text: Binding<String>
+        init(text: Binding<String>) { self.text = text }
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSSearchField else { return }
+            text.wrappedValue = field.stringValue
+        }
+    }
+}
+
+struct MonitorView: View {
+    @ObservedObject private var monitor = PanelController.shared.monitor
+    @ObservedObject private var panel = PanelController.shared
+    @State private var pending: Entry?
+    @State private var expanded = Set<String>()
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("bgMon").font(.title2.bold())
+                Button { panel.togglePin() } label: {
+                    Image(systemName: panel.pinned ? "pin.fill" : "pin")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(panel.pinned ? Color.accentColor : Color.secondary)
+                .help(panel.pinned ? "Unpin Window" : "Pin Window")
+                .accessibilityLabel(panel.pinned ? "Unpin Window" : "Pin Window")
+                Button { panel.showSettings() } label: { Image(systemName: "gearshape") }
+                    .buttonStyle(.plain).foregroundStyle(.blue).help("Settings").accessibilityLabel("Settings")
+                Spacer()
+                Text("\(monitor.groups.reduce(0) { $0 + $1.entries.count }) processes").foregroundStyle(.secondary)
+                Button { Task { await monitor.refresh() } } label: { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.blue).help("Refresh").accessibilityLabel("Refresh").disabled(monitor.refreshing)
+            }
+            HStack(spacing: 8) {
+                NativeSearchField(text: $monitor.search).frame(height: 24)
+                Menu {
+                    Toggle("Include Apple apps and system helpers", isOn: $monitor.includeSystem)
+                    Toggle("High resource usage", isOn: $monitor.highUsageOnly)
+                } label: {
+                    Image(systemName: "line.3.horizontal.decrease")
+                        .foregroundStyle(monitor.includeSystem || monitor.highUsageOnly ? Color.blue : Color.secondary)
+                        .frame(width: 20, height: 20)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("Filters")
+                .accessibilityLabel("Filters")
+            }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(monitor.groups) { group in
+                        DisclosureGroup(isExpanded: Binding(
+                            get: { expanded.contains(group.id) },
+                            set: { if $0 { expanded.insert(group.id) } else { expanded.remove(group.id) } }
+                        )) {
+                            ForEach(group.entries) { entry in
+                        HStack(spacing: 8) {
+                            if let icon = monitor.icon(for: entry) {
+                                Image(nsImage: icon).resizable().scaledToFit().frame(width: 18, height: 18)
+                            } else {
+                                Image(systemName: "terminal").font(.system(size: 15)).foregroundStyle(.secondary).frame(width: 18, height: 18)
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(monitor.apps[entry.id]?.localizedName ?? entry.name).font(.system(size: 11, weight: .medium)).lineLimit(1).truncationMode(.tail)
+                                Text("PID \(entry.id) · CPU \(entry.cpu)% · \(entry.memory)").font(.system(size: 10)).foregroundStyle(.secondary)
+                                if !entry.ports.isEmpty {
+                                    Text("Listening: " + entry.ports.map(String.init).joined(separator: ", "))
+                                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                                        .textSelection(.enabled)
+                                }
+                            }
+                            Spacer()
+                            Button { monitor.stop(entry, force: false) } label: {
+                                Image(systemName: "power").frame(width: 16, height: 16)
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.blue)
+                            .help("Stop Process")
+                            .accessibilityLabel("Stop Process")
+                            Menu {
+                                Button("Show in Finder") { monitor.showInFinder(entry) }
+                                Divider()
+                                Button("Force Stop…", role: .destructive) { pending = entry }
+                            } label: { Image(systemName: "ellipsis") }.menuIndicator(.hidden).menuStyle(.borderlessButton).frame(width: 20).help("More actions")
+                        }.controlSize(.small).font(.system(size: 11)).padding(.leading, 12).padding(.vertical, 6).help(entry.command + "\nParent PID: \(entry.parent)")
+
+                            }
+                        } label: {
+                            HStack(spacing: 8) {
+                                Button {
+                                    if expanded.contains(group.id) { expanded.remove(group.id) }
+                                    else { expanded.insert(group.id) }
+                                } label: {
+                                    HStack(spacing: 8) {
+                                if let icon = group.icon {
+                                    Image(nsImage: icon).resizable().scaledToFit().frame(width: 28, height: 28)
+                                } else {
+                                    Image(systemName: "terminal").frame(width: 28, height: 28).foregroundStyle(.secondary)
+                                }
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack(spacing: 4) {
+                                        Text(group.name).fontWeight(.medium).lineLimit(1)
+                                        if monitor.warnings[group.id] != nil {
+                                            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                                        }
+                                    }
+                                    Text(group.totals).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                                    if !group.ports.isEmpty {
+                                        Text("Ports: " + group.ports.map(String.init).joined(separator: ", "))
+                                            .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                                            .help("Listening TCP ports: " + group.ports.map(String.init).joined(separator: ", "))
+                                    }
+                                }
+                                Spacer()
+                                Text("\(group.entries.count)").font(.caption).foregroundStyle(.secondary)
+                                    }.contentShape(Rectangle())
+                                }.buttonStyle(.plain)
+                                Button { monitor.stopAll(group) } label: {
+                                    Image(systemName: "power").frame(width: 20, height: 20)
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(.blue)
+                                .help("Stop All Processes in " + group.name)
+                                .accessibilityLabel("Stop All Processes in " + group.name)
+                            }
+                        }.padding(.vertical, 9)
+                        .help(monitor.warnings[group.id] ?? "")
+                        Divider()
+                    }
+                }
+
+            }.scrollIndicators(.hidden).frame(height: 420)
+            if let message = monitor.message {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .transition(.opacity)
+            }
+        }.padding(12).frame(width: 360)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .animation(.easeInOut(duration: 0.25), value: monitor.message)
+        .tint(.blue)
+        .buttonStyle(.borderedProminent)
+
+        .alert("Force stop this process?", isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } })) {
+            Button("Cancel", role: .cancel) { pending = nil }
+            Button("Force Stop", role: .destructive) { if let pending { monitor.stop(pending, force: true) }; pending = nil }
+        } message: { Text("Unsaved work may be lost. \(pending?.name ?? "")") }
+    }
+}
+
+struct WarningSettingsView: View {
+    @AppStorage("warningCPUPercent") private var cpu = 75.0
+    @AppStorage("warningMemoryGB") private var memory = 2.0
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Resource Warnings").font(.headline)
+            Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 16) {
+                GridRow {
+                    Text("CPU Threshold")
+                    Stepper(value: $cpu, in: 1...1000, step: 5) {
+                        Text("\(cpu.formatted())%").monospacedDigit().frame(width: 85, alignment: .trailing)
+                    }
+                }
+                GridRow {
+                    Text("Memory Threshold")
+                    Stepper(value: $memory, in: 0.25...128, step: 0.25) {
+                        Text("\(memory.formatted()) GB").monospacedDigit().frame(width: 85, alignment: .trailing)
+                    }
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Restore Defaults") { cpu = 75; memory = 2 }
+            }
+        }.padding(24).frame(width: 390)
+        .onChange(of: cpu) { PanelController.shared.monitor.reevaluateWarnings() }
+        .onChange(of: memory) { PanelController.shared.monitor.reevaluateWarnings() }
+    }
+}
+
+@main enum BgMonApp {
+    @MainActor static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        withExtendedLifetime(delegate) { app.run() }
+    }
+}

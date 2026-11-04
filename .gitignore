@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+outputs/
+work/
+.DS_Store
+*.dSYM/
+
+.build-release/
