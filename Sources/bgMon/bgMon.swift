@@ -259,6 +259,9 @@ struct ProcessGroup: Identifiable {
     private var statusItem: NSStatusItem?
     private let popover = NSPopover()
     private var settingsWindow: NSWindow?
+    private var localClickMonitor: Any?
+    private var globalClickMonitor: Any?
+    private var trackingMenus = Set<ObjectIdentifier>()
     func showSettings() {
         if settingsWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 438, height: 460), styleMask: [.titled, .closable], backing: .buffered, defer: false)
@@ -300,6 +303,8 @@ struct ProcessGroup: Identifiable {
         popover.behavior = .transient
         popover.delegate = self
         popover.contentViewController = NSHostingController(rootView: MonitorView())
+        NotificationCenter.default.addObserver(self, selector: #selector(menuBeganTracking(_:)), name: NSMenu.didBeginTrackingNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(menuEndedTracking(_:)), name: NSMenu.didEndTrackingNotification, object: nil)
         monitoringTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -328,6 +333,55 @@ struct ProcessGroup: Identifiable {
     }
 
     @objc private func quitApp() { NSApplication.shared.terminate(nil) }
+
+    @objc private func menuBeganTracking(_ notification: Notification) {
+        if let menu = notification.object as? NSMenu { trackingMenus.insert(ObjectIdentifier(menu)) }
+    }
+
+    @objc private func menuEndedTracking(_ notification: Notification) {
+        if let menu = notification.object as? NSMenu { trackingMenus.remove(ObjectIdentifier(menu)) }
+    }
+
+    func popoverDidShow(_ notification: Notification) {
+        removeClickMonitors()
+        // Native transient dismissal can stop working after a SwiftUI Menu tracks.
+        // Monitor both this app's windows and clicks delivered to other apps.
+        let clicks: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: clicks) { [weak self] event in
+            MainActor.assumeIsolated { self?.handleLocalClick(event) }
+            return event
+        }
+        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: clicks) { [weak self] _ in
+            MainActor.assumeIsolated { self?.closeOnOutsideClick() }
+        }
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        removeClickMonitors()
+    }
+
+    private func removeClickMonitors() {
+        if let localClickMonitor { NSEvent.removeMonitor(localClickMonitor) }
+        if let globalClickMonitor { NSEvent.removeMonitor(globalClickMonitor) }
+        localClickMonitor = nil
+        globalClickMonitor = nil
+    }
+
+    private func handleLocalClick(_ event: NSEvent) {
+        guard let window = event.window else { return }
+        if window === NSApp.modalWindow { return }
+        if let popoverWindow = popover.contentViewController?.view.window,
+           window === popoverWindow || window.sheetParent === popoverWindow || window.parent === popoverWindow { return }
+        // Let the status button's action toggle the panel without reopening it.
+        if let button = statusItem?.button, window === button.window,
+           button.bounds.contains(button.convert(event.locationInWindow, from: nil)) { return }
+        closeOnOutsideClick()
+    }
+
+    private func closeOnOutsideClick() {
+        guard popover.isShown, !pinned, trackingMenus.isEmpty else { return }
+        popover.performClose(nil)
+    }
 
     func togglePin() {
         pinned.toggle()

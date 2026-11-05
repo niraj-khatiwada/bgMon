@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.1 — 2026-11-05
+
+- Keep unpinned popovers dismissing on outside clicks after using the filter menu.
+
 ## 1.2.0 — 2026-11-05
 
 - Allow stopping leftover processes whose executables were deleted during uninstall, using the process owner and start time to protect against reused PIDs.
