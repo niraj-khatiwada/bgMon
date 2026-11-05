@@ -494,8 +494,7 @@ struct MonitorView: View {
                     .allowsHitTesting(false)
             }
         }
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        // NSPopover supplies the material and corner shape, including its arrow.
         .animation(.easeInOut(duration: 0.25), value: monitor.message)
         .tint(.blue)
         .buttonStyle(.borderedProminent)
