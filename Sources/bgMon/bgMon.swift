@@ -604,6 +604,10 @@ struct WarningSettingsView: View {
                     }
                 }
             }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            Text("bgMon · Version \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Development")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }.padding(24).frame(width: 438, height: 460)
         .onChange(of: cpu) { PanelController.shared.monitor.reevaluateWarnings() }
         .onChange(of: memory) { PanelController.shared.monitor.reevaluateWarnings() }

@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 — 2026-11-05
 
 - Ignore resource warnings for individual apps with a button beside their warning icon.
 - Manage the saved ignore list in Settings, including apps that are not running.
+- Show the app version in Settings.
+- Use the native popover corners to fix the doubled corner outline.
 
 ## 1.0.0 — 2026-11-05
 
