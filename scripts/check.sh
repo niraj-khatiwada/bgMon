@@ -10,3 +10,5 @@ swiftc Sources/bgMon/ListeningPorts.swift Tests/Ports/main.swift -o "$check_dir/
 "$check_dir/ports"
 swiftc Sources/bgMon/WarningIgnoreList.swift Tests/WarningIgnoreList/main.swift -o "$check_dir/warning-ignore-list"
 "$check_dir/warning-ignore-list"
+swiftc Sources/bgMon/ProcessControl.swift Tests/ProcessControl/main.swift -o "$check_dir/process-control"
+"$check_dir/process-control"

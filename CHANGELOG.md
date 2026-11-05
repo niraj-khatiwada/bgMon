@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.0 — 2026-11-05
+
+- Allow stopping leftover processes whose executables were deleted during uninstall, using the process owner and start time to protect against reused PIDs.
+- Apply the fix to both normal stop and force quit, including app group actions.
+- Add regression checks for deleted executables, stale process identities, and changed executable paths.
+
 ## 1.1.0 — 2026-11-05
 
 - Ignore resource warnings for individual apps with a button beside their warning icon.

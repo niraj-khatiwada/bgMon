@@ -21,6 +21,7 @@ struct Entry: Identifiable, Sendable {
     let cpu: String
     let memory: String
     let command: String
+    var identity: ProcessIdentity?
     var ports: [Int] = []
     var name: String { URL(fileURLWithPath: command).lastPathComponent }
 }
@@ -166,6 +167,7 @@ struct ProcessGroup: Identifiable {
                 let fields = line.split(maxSplits: 4, omittingEmptySubsequences: true, whereSeparator: { $0.isWhitespace })
                 guard fields.count == 5, let pid = Int32(fields[0]), let parent = Int32(fields[1]), pid != getpid(), pid != task.processIdentifier else { return nil }
                 var entry = Entry(id: pid, parent: parent, cpu: sampler.display(pid: pid), memory: ProcessMemory.display(pid: pid), command: String(fields[4]))
+                entry.identity = ProcessIdentity.read(pid: pid)
                 entry.ports = ports[pid] ?? []
                 return entry
             }
@@ -234,18 +236,18 @@ struct ProcessGroup: Identifiable {
         Task { await refresh() }
     }
     func stop(_ entry: Entry, force: Bool, refreshAfter: Bool = true) {
-        // Refuse to signal a reused PID pointing at a different executable.
-        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
-        let count = proc_pidpath(entry.id, &buffer, UInt32(buffer.count))
-        let path = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
-        guard count > 0, String(decoding: path, as: UTF8.self) == entry.command else {
-            message = "This process changed or exited. Refresh and try again."
+        if let failure = ProcessControl.validate(pid: entry.id, command: entry.command, identity: entry.identity) {
+            message = failure.message
             return
         }
         if !force, let app = apps[entry.id] {
             message = app.terminate() ? "Quit requested. The app may ask you to save work." : "The app declined the quit request."
         } else {
-            message = kill(entry.id, force ? SIGKILL : SIGTERM) == 0 ? "Stop requested. A supervising service may restart it." : "Unable to stop this process: \(String(cString: strerror(errno)))"
+            if let failure = ProcessControl.stop(pid: entry.id, command: entry.command, identity: entry.identity, force: force) {
+                message = failure.message
+            } else {
+                message = force ? "Force quit requested. A supervising service may restart it." : "Stop requested. A supervising service may restart it."
+            }
         }
         if refreshAfter { Task { await refresh() } }
     }
