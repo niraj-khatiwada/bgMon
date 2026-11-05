@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Ignore resource warnings for individual apps with a button beside their warning icon.
+- Manage the saved ignore list in Settings, including apps that are not running.
+
 ## 1.0.0 — 2026-11-05
 
 Initial release of bgMon for macOS.

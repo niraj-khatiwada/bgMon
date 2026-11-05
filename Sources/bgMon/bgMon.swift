@@ -30,6 +30,8 @@ struct ProcessGroup: Identifiable {
     let name: String
     let icon: NSImage?
     let entries: [Entry]
+    // Bundle identifiers survive app updates and moves; standalone processes use their path.
+    var warningID: String { Bundle(path: id)?.bundleIdentifier.map { "bundle:\($0)" } ?? "path:\(id)" }
     var ports: [Int] { Set(entries.flatMap(\.ports)).sorted() }
     var cpuTotal: Double { entries.reduce(0) { $0 + (Double($1.cpu) ?? 0) } }
     var memoryTotal: Double { entries.reduce(0) { $0 + (Double($1.memory.replacingOccurrences(of: " MB", with: "")) ?? 0) } }
@@ -45,6 +47,7 @@ struct ProcessGroup: Identifiable {
 @MainActor final class Monitor: ObservableObject {
     @Published var entries: [Entry] = []
     @Published var warnings: [String: String] = [:]
+    @Published private(set) var ignoredWarningApps = WarningIgnoreList()
     private var cachedGroups: [ProcessGroup] = []
     private var ownerCache: [Int32: URL] = [:]
     private var iconCache: [String: NSImage] = [:]
@@ -177,6 +180,14 @@ struct ProcessGroup: Identifiable {
         reevaluateWarnings(countSample: true)
         refreshing = false
     }
+    func ignoreWarnings(for group: ProcessGroup) {
+        ignoredWarningApps.ignore(id: group.warningID, name: group.name)
+        reevaluateWarnings()
+    }
+    func restoreWarnings(for id: String) {
+        ignoredWarningApps.remove(id)
+        reevaluateWarnings()
+    }
     func reevaluateWarnings(countSample: Bool = false) {
         if previousCPUThreshold != cpuThreshold { highCPUSamples.removeAll(); previousCPUThreshold = cpuThreshold }
         var updated: [String: String] = [:]
@@ -184,6 +195,10 @@ struct ProcessGroup: Identifiable {
         let liveIDs = Set(allGroups.map(\.id))
         highCPUSamples = highCPUSamples.filter { liveIDs.contains($0.key) }
         for group in allGroups {
+            guard !ignoredWarningApps.contains(group.warningID) else {
+                highCPUSamples.removeValue(forKey: group.id)
+                continue
+            }
             if countSample { highCPUSamples[group.id] = group.cpuTotal > cpuThreshold ? (highCPUSamples[group.id] ?? 0) + 1 : 0 }
             var reasons: [String] = []
             if (highCPUSamples[group.id] ?? 0) >= 3 { reasons.append("CPU above \(cpuThreshold.formatted())% for three refreshes") }
@@ -244,7 +259,7 @@ struct ProcessGroup: Identifiable {
     private var settingsWindow: NSWindow?
     func showSettings() {
         if settingsWindow == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 390, height: 200), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 438, height: 460), styleMask: [.titled, .closable], backing: .buffered, defer: false)
             window.title = "bgMon Settings"
             window.isReleasedWhenClosed = false
             window.contentViewController = NSHostingController(rootView: WarningSettingsView())
@@ -436,17 +451,30 @@ struct MonitorView: View {
                                     if expanded.contains(group.id) { expanded.remove(group.id) }
                                     else { expanded.insert(group.id) }
                                 } label: {
-                                    HStack(spacing: 8) {
-                                if let icon = group.icon {
-                                    Image(nsImage: icon).resizable().scaledToFit().frame(width: 28, height: 28)
-                                } else {
-                                    Image(systemName: "terminal").frame(width: 28, height: 28).foregroundStyle(.secondary)
-                                }
+                                    if let icon = group.icon {
+                                        Image(nsImage: icon).resizable().scaledToFit().frame(width: 28, height: 28)
+                                    } else {
+                                        Image(systemName: "terminal").frame(width: 28, height: 28).foregroundStyle(.secondary)
+                                    }
+                                }.buttonStyle(.plain)
                                 VStack(alignment: .leading, spacing: 2) {
                                     HStack(spacing: 4) {
-                                        Text(group.name).fontWeight(.medium).lineLimit(1)
+                                        Button {
+                                            if expanded.contains(group.id) { expanded.remove(group.id) }
+                                            else { expanded.insert(group.id) }
+                                        } label: {
+                                            Text(group.name).fontWeight(.medium).lineLimit(1)
+                                        }.buttonStyle(.plain)
                                         if monitor.warnings[group.id] != nil {
                                             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                                            Button { monitor.ignoreWarnings(for: group) } label: {
+                                                Image(systemName: "bell.slash")
+                                                    .frame(width: 20, height: 20)
+                                            }
+                                            .buttonStyle(.plain)
+                                            .foregroundStyle(.secondary)
+                                            .help("Ignore resource warnings for " + group.name)
+                                            .accessibilityLabel("Ignore resource warnings for " + group.name)
                                         }
                                     }
                                     Text(group.totals).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
@@ -458,8 +486,6 @@ struct MonitorView: View {
                                 }
                                 Spacer()
                                 Text("\(group.entries.count)").font(.caption).foregroundStyle(.secondary)
-                                    }.contentShape(Rectangle())
-                                }.buttonStyle(.plain)
                                 Button {
                                     if monitor.recentlyRequestedQuit(group) { pendingGroup = group }
                                     else { monitor.stopAll(group) }
@@ -525,6 +551,7 @@ struct MonitorView: View {
 struct WarningSettingsView: View {
     @AppStorage("warningCPUPercent") private var cpu = 75.0
     @AppStorage("warningMemoryGB") private var memory = 2.0
+    @ObservedObject private var monitor = PanelController.shared.monitor
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Text("Resource Warnings").font(.headline)
@@ -546,7 +573,38 @@ struct WarningSettingsView: View {
                 Spacer()
                 Button("Restore Defaults") { cpu = 75; memory = 2 }
             }
-        }.padding(24).frame(width: 390)
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Ignored Apps").font(.headline)
+                Text("Ignored apps stay in the process list but do not trigger resource warnings.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if monitor.ignoredWarningApps.apps.isEmpty {
+                    Text("No ignored apps")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView {
+                        VStack(spacing: 8) {
+                            ForEach(monitor.ignoredWarningApps.apps.keys.sorted {
+                                let left = monitor.ignoredWarningApps.apps[$0] ?? $0
+                                let right = monitor.ignoredWarningApps.apps[$1] ?? $1
+                                return left == right ? $0 < $1 : left.localizedStandardCompare(right) == .orderedAscending
+                            }, id: \.self) { id in
+                                HStack {
+                                    Text(monitor.ignoredWarningApps.apps[id] ?? id)
+                                        .lineLimit(1).truncationMode(.middle)
+                                        .help(id)
+                                    Spacer()
+                                    Button("Remove") { monitor.restoreWarnings(for: id) }
+                                        .help("Re-enable resource warnings for this app")
+                                        .accessibilityLabel("Re-enable resource warnings for " + (monitor.ignoredWarningApps.apps[id] ?? id))
+                                }
+                            }
+                        }
+                    }
+                }
+            }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }.padding(24).frame(width: 438, height: 460)
         .onChange(of: cpu) { PanelController.shared.monitor.reevaluateWarnings() }
         .onChange(of: memory) { PanelController.shared.monitor.reevaluateWarnings() }
     }

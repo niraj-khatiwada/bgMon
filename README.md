@@ -10,6 +10,8 @@ Open bgMon, then left-click its menu bar icon. Pin the panel to keep it open. Ex
 
 The filter menu controls system-process visibility and high-resource-usage filtering. Settings contains CPU and memory warning thresholds. CPU percentages use one core as 100% and can exceed 100%. CPU warnings require three consecutive samples above the limit. Memory uses physical footprint in decimal MB; group totals sum individual process measurements.
 
+Click the crossed-out bell beside an app's resource warning to ignore warnings for that app and its grouped helpers. Ignored apps remain in the normal process list but do not turn the menu bar icon red or appear in the high-resource-usage filter. The ignore list is saved across launches. Remove an app under **Settings → Ignored Apps** to re-enable its warnings.
+
 Grouping is best effort. Shared or separately launched system services may not be attributed to an app. A process may restart after stopping if supervised by another service.
 
 ## Build and package
